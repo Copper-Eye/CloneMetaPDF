@@ -1,5 +1,2 @@
-lxml
-packaging
-pikepdf
-pillow
-wrapt
+pikepdf>=10.0.0
+xattr>=1.3.0

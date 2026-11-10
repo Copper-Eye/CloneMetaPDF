@@ -1,100 +1,309 @@
+
+#!/usr/bin/env python3
+
 import os
 import sys
+import argparse
 import pikepdf
+import xattr
 
-def clone_pdf_attributes(source_pdf_path, target_pdf_path):
-    """
-    Clones metadata from source_pdf to target_pdf and saves it with a new name.
-    """
-    if not os.path.exists(source_pdf_path):
-        print(f"Error: Source file '{source_pdf_path}' not found.")
-        return
-    if not os.path.exists(target_pdf_path):
-        print(f"Error: Target file '{target_pdf_path}' not found.")
-        return
+DEFAULT_MACOS_ATTRIBUTES = [
+    "com.apple.metadata:kMDItemWhereFroms",
+    "com.apple.metadata:kMDItemDownloadedDate",
+    "com.apple.metadata:kMDItemFinderComment",
+    "com.apple.metadata:_kMDItemUserTags",
+]
 
-    print(f"Cloning metadata from: {source_pdf_path}")
-    print(f"Applying to: {target_pdf_path}")
+EXCLUDED_MACOS_ATTRIBUTES = {
+    "com.apple.quarantine",
+}
 
-    # Open both PDFs
-    with pikepdf.open(source_pdf_path) as src, pikepdf.open(target_pdf_path) as dst:
-        # Capture Producer immediately before pikepdf modifies it (e.g. by accessing XMP)
-        src_producer = src.docinfo.get('/Producer')
-        
-        # 1. Strip existing metadata from target
-        for key in list(dst.docinfo.keys()):
-            del dst.docinfo[key]
+DEFAULT_EXCLUDED_XMP = {
+    "xmp:CreateDate",
+    "xmp:ModifyDate",
+    "xmp:MetadataDate",
+    "pdf:Producer",
+    "xmpMM:DocumentID",
+    "xmpMM:InstanceID",
+    "pdfaid:part",
+    "pdfaid:conformance",
+}
 
-        def copy_value(obj):
-            """
-            Copies a pikepdf object to the destination.
-            Handles indirect objects via copy_foreign.
-            Handles direct objects by converting to Python native types where necessary.
-            """
-            if isinstance(obj, pikepdf.Object) and obj.is_indirect:
-                return dst.copy_foreign(obj)
-            
-            # Direct objects: convert to Python types to create new objects in dst
-            if isinstance(obj, pikepdf.String):
-                return str(obj)
-            elif isinstance(obj, pikepdf.Name):
-                return pikepdf.Name(str(obj))
-            elif isinstance(obj, pikepdf.Integer):
-                return int(obj)
-            elif isinstance(obj, pikepdf.Real):
-                return float(obj)
-            elif isinstance(obj, pikepdf.Boolean):
-                return bool(obj)
-            elif isinstance(obj, pikepdf.Array):
-                return [copy_value(x) for x in obj]
-            elif isinstance(obj, pikepdf.Dictionary):
-                # Recursively copy dictionary items
-                return {k: copy_value(v) for k, v in obj.items()}
-            
-            # Fallback for unknown types or native python types
-            return obj
+def copy_macos_metadata(
+    source,
+    destination,
+    full=False,
+    extra_attributes=None
+):
 
-        # 2. Clone the Document Info dictionary (Title, Author, etc.)
-        if src.docinfo:
-            for key, value in src.docinfo.items():
+    print("\n===== MACOS EXTENDED ATTRIBUTES =====")
+    excluded = {"com.apple.quarantine"}
+    default_attributes = {
+        "com.apple.metadata:kMDItemWhereFroms",
+        "com.apple.metadata:kMDItemDownloadedDate",
+        "com.apple.metadata:kMDItemFinderComment",
+        "com.apple.metadata:_kMDItemUserTags",
+    }
+    extra_attributes = set(extra_attributes or [])
+    src_attrs = xattr.xattr(source)
+    dst_attrs = xattr.xattr(destination)
+    source_attributes = set(src_attrs.keys())
+
+    if full:
+        attributes = source_attributes
+        print("FULL MODE: copying all extended attributes.")
+    else:
+        attributes = default_attributes
+    attributes.update(extra_attributes)
+    attributes -= excluded
+    if full:
+        for attribute in list(dst_attrs.keys()):
+            if attribute not in excluded:
                 try:
-                    dst.docinfo[key] = copy_value(value)
-                except Exception as e:
-                    print(f"Warning: Could not copy metadata key {key}: {e}")
-        
-        # 3. Clone/Overwrite XMP metadata
-        if '/Metadata' in src.Root:
-            with dst.open_metadata() as dst_meta:
-                 # Clear existing XMP metadata in target
-                for key in list(dst_meta.keys()):
-                    del dst_meta[key]
-                
-                with src.open_metadata() as src_meta:
-                    # Copy all XMP entries
-                    for key in src_meta:
-                        dst_meta[key] = src_meta[key]
+                    del dst_attrs[attribute]
+                except OSError as e:
+                    print(f"Could not remove {attribute}: {e}")
+
+    copied = 0
+    skipped = 0
+    failed = 0
+
+    for attribute in sorted(attributes):
+        if attribute not in source_attributes:
+            skipped += 1
+            continue
+        try:
+            dst_attrs[attribute] = src_attrs[attribute]
+            print(f"Copied: {attribute}")
+            copied += 1
+        except Exception as e:
+            print(f"Failed: {attribute}: {e}")
+            failed += 1
+
+    print("\nMACOS ATTRIBUTE SUMMARY")
+    print(f"Copied:  {copied}")
+    print(f"Skipped: {skipped}")
+    print(f"Failed:  {failed}")
+
+def copy_pdf_metadata(
+    source,
+    target,
+    output,
+    all_xmp=False
+):
+
+    print("\n===== PDF METADATA =====")
+    excluded_xmp = (
+        set() if all_xmp else DEFAULT_EXCLUDED_XMP
+    )
+    with (
+        pikepdf.open(source) as src,
+        pikepdf.open(target) as dst
+    ):
+        if "/Info" in src.trailer:
+            dst.trailer["/Info"] = dst.copy_foreign(
+                src.trailer["/Info"]
+            )
+            print("Document Info dictionary copied.")
         else:
-            # Source has no XMP, so remove it from target if present
-            if '/Metadata' in dst.Root:
-                del dst.Root['/Metadata']
+            if "/Info" in dst.trailer:
+                del dst.trailer["/Info"]
+            print("Source has no Document Info dictionary.")
+        if "/Metadata" in src.Root:
+            with (
+                src.open_metadata(
+                    set_pikepdf_as_editor=False,
+                    update_docinfo=False
+                ) as src_meta,
 
-        # 4. Spoof the Producer (Encoding software)
-        # pikepdf often appends its version to /Producer unless explicitly set
-        if src_producer:
-             # Ensure the Producer is strictly copied from source, overwriting any previous setting
-             dst.docinfo['/Producer'] = copy_value(src_producer)
+                dst.open_metadata(
+                    set_pikepdf_as_editor=False,
+                    update_docinfo=False
+                ) as dst_meta
+            ):
 
-        # Determine the new filename based on source name + (edit)
-        source_basename = os.path.splitext(os.path.basename(source_pdf_path))[0]
-        output_filename = f"{source_basename} (edit).pdf"
-        output_path = os.path.join(os.path.dirname(target_pdf_path), output_filename)
+                for key in list(dst_meta):
+                    del dst_meta[key]
+                copied = dst_meta.copy_properties(
+                    src_meta,
+                    list(src_meta),
+                    exclude=excluded_xmp,
+                    overwrite=True
+                )
 
-        # Save the result
-        dst.save(output_path)
-        print(f"Successfully saved to: {output_path}")
+                print(f"XMP properties copied: {len(copied)}")
+
+                if excluded_xmp:
+                    excluded_found = (
+                        excluded_xmp.intersection(src_meta.keys())
+                    )
+                    if excluded_found:
+                        print("Excluded document-specific properties:")
+                        for key in sorted(excluded_found):
+                            print(f"  - {key}")
+
+        else:
+            if "/Metadata" in dst.Root:
+                del dst.Root["/Metadata"]
+            print("Source has no XMP metadata.")
+
+        dst.save(
+            output,
+            fix_metadata_version=False
+        )
+
+    print("PDF metadata saved successfully.")
+
+def clone_pdf_attributes(
+    source_pdf_path,
+    target_pdf_path,
+    full=False,
+    extra_attributes=None,
+    all_xmp=False,
+    overwrite=False
+):
+
+    source_pdf_path = os.path.abspath(source_pdf_path)
+    target_pdf_path = os.path.abspath(target_pdf_path)
+
+    if not os.path.isfile(source_pdf_path):
+        raise FileNotFoundError(
+            f"Source PDF not found: {source_pdf_path}"
+        )
+
+    if not os.path.isfile(target_pdf_path):
+        raise FileNotFoundError(
+            f"Target PDF not found: {target_pdf_path}"
+        )
+
+    if os.path.samefile(source_pdf_path, target_pdf_path):
+        raise ValueError(
+            "Source and target must be different files."
+        )
+
+    source_basename = os.path.splitext(
+        os.path.basename(source_pdf_path)
+    )[0]
+
+    output_filename = f"{source_basename} (edit).pdf"
+
+    output_path = os.path.join(
+        os.path.dirname(target_pdf_path),
+        output_filename
+    )
+
+    if os.path.abspath(output_path) in (
+        source_pdf_path,
+        target_pdf_path
+    ):
+        raise ValueError(
+            "Output path conflicts with source or target."
+        )
+
+    if os.path.exists(output_path) and not overwrite:
+        raise FileExistsError(
+            f"Output already exists: {output_path}\n"
+            "Use --overwrite to replace it."
+        )
+
+    print("=" * 60)
+    print("                 PDF METADATA CLONER")
+    print("=" * 60)
+    print(f"\nSource: {source_pdf_path}")
+    print(f"Target: {target_pdf_path}")
+    print(f"Output: {output_path}")
+    print(f"\nFull macOS attributes: {full}")
+    print(f"All XMP properties:    {all_xmp}")
+
+    copy_pdf_metadata(
+        source_pdf_path,
+        target_pdf_path,
+        output_path,
+        all_xmp=all_xmp
+    )
+
+    copy_macos_metadata(
+        source_pdf_path,
+        output_path,
+        full=full,
+        extra_attributes=extra_attributes
+    )
+
+    print("\n" + "=" * 60)
+    print("METADATA COPYING COMPLETE")
+    print("=" * 60)
+    print(f"\nOutput:\n{output_path}")
+    return output_path
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Clone PDF metadata and macOS extended "
+            "attributes from one PDF to another."
+        )
+    )
+
+    parser.add_argument(
+        "source",
+        help="Source PDF containing the metadata."
+    )
+
+    parser.add_argument(
+        "target",
+        help="Target PDF receiving the metadata."
+    )
+
+    parser.add_argument(
+        "-full",
+        "--full",
+        action="store_true",
+        help=(
+            "Copy all macOS extended attributes "
+            "except com.apple.quarantine."
+        )
+    )
+
+    parser.add_argument(
+        "--xattr",
+        action="append",
+        default=[],
+        metavar="ATTRIBUTE",
+        help=(
+            "Add a specific macOS extended attribute "
+            "to the default copying list. Can be repeated."
+        )
+    )
+
+    parser.add_argument(
+        "--all-xmp",
+        action="store_true",
+        help=(
+            "Copy all XMP properties, including "
+            "document-specific identifiers and timestamps."
+        )
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite an existing output PDF."
+    )
+
+    args = parser.parse_args()
+
+    try:
+        clone_pdf_attributes(
+            source_pdf_path=args.source,
+            target_pdf_path=args.target,
+            full=args.full,
+            extra_attributes=args.xattr,
+            all_xmp=args.all_xmp,
+            overwrite=args.overwrite
+        )
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python clonemeta.py <source_pdf> <target_pdf>")
-    else:
-        clone_pdf_attributes(sys.argv[1], sys.argv[2])
+    main()
