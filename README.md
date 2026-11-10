@@ -2,7 +2,7 @@
 
 A Python utility for transferring PDF document metadata and macOS filesystem metadata from one PDF to another.
 
-CloneMetaPDF uses [pikepdf](https://pikepdf.readthedocs.io/) to copy PDF metadata and Python's built-in `os` module to transfer macOS extended attributes.
+CloneMetaPDF uses [pikepdf](https://pikepdf.readthedocs.io/) to copy PDF metadata, Python's built-in `os` module to transfer macOS extended attributes, as well as the `xattr` python library.
 
 The original source and target files are preserved. The resulting PDF is saved as a new file.
 
@@ -244,10 +244,11 @@ This prevents the utility from blindly transferring security-related download st
 
 ## Dependencies
 
-Only one external Python dependency is required:
+Only two external Python dependencies are required:
 
 ```text
 pikepdf>=10.0.0
+xattr>=1.3.0
 ```
 
 All other functionality uses Python's standard library.
